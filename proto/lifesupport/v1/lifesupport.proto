@@ -1,0 +1,351 @@
+syntax = "proto3";
+
+package lifesupport.v1;
+
+option go_package = "lifesupport/gen/lifesupport/v1;lifesupportv1";
+
+// ---------------------------------------------------------------------------
+// 载人舱生命保障告警模块
+//
+// 设计要点:
+//   * 所有改变系统状态的输入都是不可变事件, 追加到 SQLite 事件日志;
+//     告警状态是对日志做确定性重放得到的派生结果。
+//   * 遥测采样同时携带设备采样时钟 (device_time_ns) 与地面接收时刻
+//     (ground_recv_ns): 持续窗口用设备时钟判定, 失联/延迟用地面时刻判定。
+//   * 阈值按版本生效, 评估某条采样时选用其设备时刻所对应的阈值版本,
+//     因此离线补传与旧阈值重放都不会改变当时的结论。
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_CREW = 1;            // 乘组
+  ROLE_FLIGHT_CONTROL = 2;  // 飞控
+  ROLE_MEDICAL = 3;         // 医学支持
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_ADVISORY = 1;  // 提示
+  SEVERITY_CAUTION = 2;   // 注意
+  SEVERITY_RED = 3;       // 红色
+}
+
+enum AlertStatus {
+  ALERT_STATUS_UNSPECIFIED = 0;
+  ALERT_STATUS_OPEN = 1;      // 未确认
+  ALERT_STATUS_ACKED = 2;     // 已确认
+  ALERT_STATUS_RESOLVED = 3;  // 已解除 (只允许追加解除证据到达此态)
+}
+
+enum EnvStatus {
+  ENV_STATUS_UNSPECIFIED = 0;
+  ENV_STATUS_NOMINAL = 1;               // 正常
+  ENV_STATUS_ALERTING = 2;              // 有未解除告警
+  ENV_STATUS_INSUFFICIENT_EVIDENCE = 3; // 证据不足 (传感器失联, 不能推导安全)
+}
+
+enum MissionPhase {
+  MISSION_PHASE_UNSPECIFIED = 0;
+  MISSION_PHASE_LAUNCH = 1;
+  MISSION_PHASE_ON_ORBIT = 2;
+  MISSION_PHASE_EVA = 3;
+  MISSION_PHASE_SLEEP = 4;
+  MISSION_PHASE_DOCKING = 5;
+  MISSION_PHASE_ENTRY = 6;
+}
+
+enum RuleDirection {
+  RULE_DIRECTION_UNSPECIFIED = 0;
+  RULE_DIRECTION_ABOVE = 1;  // 超过上限为越限
+  RULE_DIRECTION_BELOW = 2;  // 低于下限为越限
+}
+
+// ---------------------------------------------------------------------------
+// 遥测采样
+// ---------------------------------------------------------------------------
+
+message Sample {
+  string sensor_id = 1;
+  int64 seq = 2;             // 星上原始采样序号 (按传感器单调), 用于去重与离线归并
+  int64 device_time_ns = 3;  // 设备采样时钟
+  int64 ground_recv_ns = 4;  // 地面接收时刻
+  double value = 5;
+}
+
+// ---------------------------------------------------------------------------
+// 事件负载 (追加到事件日志中的不可变记录)
+// ---------------------------------------------------------------------------
+
+message SampleBatchEvent {
+  repeated Sample samples = 1;
+}
+
+message RuleSpec {
+  string rule_id = 1;
+  string sensor_id = 2;
+  string group_id = 3;             // 关联传感器组, 如 "atmosphere"
+  RuleDirection direction = 4;
+  double threshold = 5;
+  int64 window_ns = 6;             // 持续窗口: 越限需持续该时长才形成告警
+  int64 max_gap_ns = 7;            // 相邻采样允许的最大间隔, 超过则窗口中断重计
+  Severity severity = 8;
+  repeated MissionPhase phases = 9;  // 适用任务阶段; 空 = 全部阶段
+  string summary = 10;
+  string crew_procedure = 11;  // 乘组处置程序编号/摘要
+}
+
+message ThresholdsActivatedEvent {
+  string version = 1;
+  int64 effective_from_device_ns = 2;  // 自该设备时刻起的采样适用本版本
+  repeated RuleSpec rules = 3;
+  string activated_by = 4;
+  string note = 5;
+}
+
+message PhaseChangedEvent {
+  MissionPhase phase = 1;
+  int64 effective_from_device_ns = 2;
+  string set_by = 3;
+}
+
+message AckEvent {
+  string alert_id = 1;
+  string operator = 2;
+  Role role = 3;
+  string note = 4;
+}
+
+message AssignEvent {
+  string alert_id = 1;
+  string operator = 2;  // 接管人
+  Role role = 3;
+  string note = 4;
+}
+
+message EvidenceEvent {
+  string alert_id = 1;
+  string operator = 2;
+  string summary = 3;
+  string detail = 4;
+}
+
+message ResolveEvent {
+  string alert_id = 1;
+  string operator = 2;
+  string summary = 3;  // 解除证据摘要 (必填)
+  string detail = 4;
+}
+
+// ---------------------------------------------------------------------------
+// 视图
+// ---------------------------------------------------------------------------
+
+message SampleRef {
+  string sensor_id = 1;
+  int64 seq = 2;
+  int64 device_time_ns = 3;
+  double value = 4;
+}
+
+message EscalationStep {
+  int32 level = 1;
+  int64 at_ns = 2;
+  string notified_role = 3;
+}
+
+message EvidenceEntry {
+  string operator = 1;
+  int64 at_ns = 2;
+  string summary = 3;
+  string detail = 4;
+  bool is_resolution = 5;
+}
+
+message AlertView {
+  string alert_id = 1;
+  string rule_id = 2;
+  string sensor_id = 3;
+  string group_id = 4;
+  Severity severity = 5;
+  AlertStatus status = 6;
+  string summary = 7;
+  string crew_procedure = 8;
+
+  int64 breach_start_ns = 9;   // 越限区间起点 (设备时钟)
+  int64 breach_end_ns = 10;    // 最近一次越限采样 (设备时钟)
+  int64 formed_ns = 11;        // 持续窗口满足时刻 (设备时钟)
+  int64 raised_ns = 12;        // 告警形成时的地面 (日志) 时刻
+
+  string threshold_version = 13;  // 判定所用阈值版本
+  MissionPhase phase = 14;        // 越限开始时任务阶段
+
+  repeated SampleRef contributing_samples = 15;  // 形成告警的采样 (仅飞控/医学可见明细)
+  int32 contributing_sample_count = 16;
+
+  string owner = 17;        // 当前接管人
+  Role owner_role = 18;
+  int64 owner_since_ns = 19;
+  string acked_by = 20;
+  int64 acked_ns = 21;
+
+  int32 escalation_level = 22;
+  repeated EscalationStep escalation_history = 23;
+  int64 next_escalation_ns = 24;      // 0 = 无后续升级
+  int64 ns_to_next_escalation = 25;   // 距下一次升级 (可能为 0)
+
+  repeated EvidenceEntry evidence = 26;
+  int64 resolved_ns = 27;
+  string resolved_by = 28;
+
+  double peak_value = 29;
+  double last_value = 30;
+}
+
+message SensorView {
+  string sensor_id = 1;
+  int64 last_device_time_ns = 2;
+  int64 last_heard_ns = 3;      // 最后一次地面收到该传感器帧的时刻
+  double last_value = 4;
+  int64 clock_offset_ns = 5;    // 地面-设备钟差估计 (EWMA)
+  int64 duplicate_frames = 6;   // 已去重的重复帧计数
+  bool silent = 7;
+}
+
+message GroupView {
+  string group_id = 1;
+  EnvStatus status = 2;
+  repeated string silent_sensors = 3;
+  repeated string open_alert_ids = 4;
+  repeated SensorView sensors = 5;
+}
+
+message HandoverView {
+  int64 generated_at_ns = 1;
+  int64 ship_time_ns = 2;  // 由遥测推得的星上当前时刻
+  repeated AlertView alerts = 3;
+  repeated GroupView groups = 4;
+  int32 open_count = 5;
+  int32 unacked_red_count = 6;
+  repeated string handover_notes = 7;  // 面向下一班的要点提示
+}
+
+// ---------------------------------------------------------------------------
+// 服务
+// ---------------------------------------------------------------------------
+
+message RequestMeta {
+  Role role = 1;
+  string operator = 2;
+}
+
+message IngestTelemetryRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;  // 为空时按内容哈希派生
+  repeated Sample samples = 3;
+}
+message IngestTelemetryResponse {
+  string event_uid = 1;
+  bool duplicate_request = 2;
+  int32 accepted = 3;
+  int32 duplicates = 4;
+  repeated string new_alert_ids = 5;
+}
+
+message ActivateThresholdsRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;
+  string version = 3;
+  int64 effective_from_device_ns = 4;
+  repeated RuleSpec rules = 5;
+  string note = 6;
+}
+message ActivateThresholdsResponse {
+  string event_uid = 1;
+  bool duplicate_request = 2;
+}
+
+message SetMissionPhaseRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;
+  MissionPhase phase = 3;
+  int64 effective_from_device_ns = 4;
+}
+message SetMissionPhaseResponse {
+  string event_uid = 1;
+  bool duplicate_request = 2;
+}
+
+message AckAlertRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;
+  string alert_id = 3;
+  string note = 4;
+}
+message AssignAlertRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;
+  string alert_id = 3;
+  string assignee = 4;
+  Role assignee_role = 5;
+  string note = 6;
+}
+message AppendEvidenceRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;
+  string alert_id = 3;
+  string summary = 4;
+  string detail = 5;
+}
+message ResolveAlertRequest {
+  RequestMeta meta = 1;
+  string idempotency_key = 2;
+  string alert_id = 3;
+  string summary = 4;
+  string detail = 5;
+}
+message AlertResponse {
+  string event_uid = 1;
+  bool duplicate_request = 2;
+  AlertView alert = 3;
+}
+
+message GetAlertRequest {
+  RequestMeta meta = 1;
+  string alert_id = 2;
+}
+message ListAlertsRequest {
+  RequestMeta meta = 1;
+  bool include_resolved = 2;
+}
+message ListAlertsResponse {
+  repeated AlertView alerts = 1;
+}
+message GetHandoverViewRequest {
+  RequestMeta meta = 1;
+}
+message GetEnvironmentStatusRequest {
+  RequestMeta meta = 1;
+}
+message EnvironmentStatusResponse {
+  int64 ship_time_ns = 1;
+  repeated GroupView groups = 2;
+}
+
+service LifeSupport {
+  // 遥测与任务事件
+  rpc IngestTelemetry(IngestTelemetryRequest) returns (IngestTelemetryResponse);
+  rpc ActivateThresholds(ActivateThresholdsRequest) returns (ActivateThresholdsResponse);
+  rpc SetMissionPhase(SetMissionPhaseRequest) returns (SetMissionPhaseResponse);
+
+  // 告警处置 (只追加, 不删除)
+  rpc AckAlert(AckAlertRequest) returns (AlertResponse);
+  rpc AssignAlert(AssignAlertRequest) returns (AlertResponse);
+  rpc AppendEvidence(AppendEvidenceRequest) returns (AlertResponse);
+  rpc ResolveAlert(ResolveAlertRequest) returns (AlertResponse);
+
+  // 查询 (按角色裁剪字段)
+  rpc GetAlert(GetAlertRequest) returns (AlertResponse);
+  rpc ListAlerts(ListAlertsRequest) returns (ListAlertsResponse);
+  rpc GetHandoverView(GetHandoverViewRequest) returns (HandoverView);
+  rpc GetEnvironmentStatus(GetEnvironmentStatusRequest) returns (EnvironmentStatusResponse);
+}

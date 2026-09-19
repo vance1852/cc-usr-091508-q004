@@ -10,3 +10,8 @@ coverage/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# 本地运行的 SQLite 事件日志
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,350 @@
+syntax = "proto3";
+
+package lifesupport.v1;
+
+option go_package = "lifesupport/gen/lifesupport/v1;lifesupportv1";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// 枚举
+// ---------------------------------------------------------------------------
+
+// 履职角色：服务端按角色投影交班视图字段。
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_CREW = 1;            // 乘组
+  ROLE_FLIGHT_CONTROL = 2;  // 飞控
+  ROLE_MEDICAL = 3;         // 医学支持
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_WARNING = 1;   // 黄
+  SEVERITY_CRITICAL = 2;  // 红
+}
+
+enum AlertState {
+  ALERT_STATE_UNSPECIFIED = 0;
+  ALERT_STATE_OPEN = 1;          // 未确认
+  ALERT_STATE_ACKNOWLEDGED = 2;  // 已确认（有人接管）
+  ALERT_STATE_RESOLVED = 3;      // 已解除（仅有追加的解除证据，从不删除）
+}
+
+// 单次判定的结论。证据不足是独立结论：单个传感器失联只能得到它，
+// 绝不能据此推断环境安全。
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  VERDICT_NOMINAL = 1;               // 窗口内指标正常
+  VERDICT_TRANSIENT = 2;             // 越限但未满足持续窗口（短暂尖峰）
+  VERDICT_SUSTAINED_BREACH = 3;      // 持续越限，形成/延续告警
+  VERDICT_INSUFFICIENT_EVIDENCE = 4; // 关联传感器缺失/失联，证据不足
+}
+
+enum MissionPhase {
+  MISSION_PHASE_UNSPECIFIED = 0;
+  MISSION_PHASE_PRELAUNCH = 1;
+  MISSION_PHASE_ASCENT = 2;
+  MISSION_PHASE_ON_ORBIT = 3;
+  MISSION_PHASE_EVA = 4;
+  MISSION_PHASE_DOCKING = 5;
+  MISSION_PHASE_REENTRY = 6;
+  MISSION_PHASE_LANDED = 7;
+}
+
+enum Comparison {
+  COMPARISON_UNSPECIFIED = 0;
+  COMPARISON_ABOVE = 1;  // 高于限值越限（如 CO2 分压）
+  COMPARISON_BELOW = 2;  // 低于限值越限（如舱压、风扇转速）
+}
+
+// ---------------------------------------------------------------------------
+// 遥测采样
+// ---------------------------------------------------------------------------
+
+// 一条采样同时携带设备采样时钟与地面接收时刻；两者用途不同：
+// 持续窗口按设备时钟判定，升级时限按地面时刻推进。
+message Sample {
+  string sensor_id = 1;
+  int64 sequence = 2;     // 设备侧原始采样序列（离线补传按此归并）
+  string frame_id = 3;    // 下行帧标识，用于重复帧去重
+  google.protobuf.Timestamp device_time = 4;  // 设备采样时钟
+  google.protobuf.Timestamp ground_time = 5;  // 地面接收时刻
+  double value = 6;
+  string unit = 7;
+  int32 quality = 8;  // 0 = 有效；非 0 仅存档不参与判定
+}
+
+message IngestSamplesRequest {
+  repeated Sample samples = 1;
+  // 客户端提供的幂等键：进程中断后重投同一批不会产生重复效果。
+  string submission_id = 2;
+}
+
+message IngestSamplesResponse {
+  int32 accepted = 1;
+  int32 duplicates = 2;  // 重复帧/重复序列被去重的数量
+  int32 conflicts = 3;   // 同序列不同取值（保留先到的，记录冲突）
+}
+
+// ---------------------------------------------------------------------------
+// 阈值版本与任务阶段
+// ---------------------------------------------------------------------------
+
+message ThresholdRule {
+  string name = 1;          // 规则名，如 co2_high
+  string metric_sensor = 2; // 主传感器
+  string unit = 3;
+  Comparison comparison = 4;
+  double warning_limit = 5;
+  double critical_limit = 6;
+  google.protobuf.Duration warning_window = 7;   // 黄警持续窗口（设备时钟）
+  google.protobuf.Duration critical_window = 8;  // 红警持续窗口（设备时钟）
+  google.protobuf.Duration recovery_window = 9;  // 恢复正常持续多久可自动解除
+  google.protobuf.Duration max_sample_gap = 10;  // 超过此间隔视为证据中断
+  repeated string corroborators = 11;            // 关联传感器（必须在线）
+  google.protobuf.Duration corroborator_staleness = 12;  // 关联传感器允许的最大滞后
+  string summary_warning = 13;   // 面向乘组的简述（黄）
+  string summary_critical = 14;  // 面向乘组的简述（红）
+  string crew_action_warning = 15;
+  string crew_action_critical = 16;
+}
+
+message EscalationStep {
+  int32 level = 1;
+  // 未确认告警自开启起经过该时长升级；已确认未解除告警自确认起经过该时长再升级。
+  google.protobuf.Duration after_unacknowledged = 2;
+  google.protobuf.Duration after_unresolved = 3;
+  string notify = 4;  // 通知对象描述
+}
+
+message EscalationPolicy {
+  repeated EscalationStep critical_steps = 1;
+  repeated EscalationStep warning_steps = 2;
+}
+
+message ThresholdVersionConfig {
+  string version = 1;
+  // 生效时刻（设备时钟）。允许注册生效时刻在过去的旧版本用于重放审计，
+  // 但不会改写当时已记录的结论。
+  google.protobuf.Timestamp effective_from_device_time = 2;
+  repeated ThresholdRule rules = 3;
+  EscalationPolicy escalation = 4;
+  // 任务阶段对限值的覆盖：phase 名称 -> 规则名 -> 限值覆盖。
+  repeated PhaseLimitOverride phase_overrides = 5;
+}
+
+message PhaseLimitOverride {
+  MissionPhase phase = 1;
+  string rule = 2;
+  optional double warning_limit = 3;
+  optional double critical_limit = 4;
+}
+
+message RegisterThresholdVersionRequest {
+  ThresholdVersionConfig config = 1;
+  google.protobuf.Timestamp occurred_at_ground = 2;  // 缺省由服务端打地面时标
+}
+
+message RegisterThresholdVersionResponse {
+  string version = 1;
+}
+
+message SetMissionPhaseRequest {
+  MissionPhase phase = 1;
+  google.protobuf.Timestamp effective_device_time = 2;  // 阶段开始的设备时刻
+  google.protobuf.Timestamp occurred_at_ground = 3;
+}
+
+message SetMissionPhaseResponse {
+  MissionPhase phase = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 确认 / 解除证据 / 删除
+// ---------------------------------------------------------------------------
+
+message AcknowledgeAlertRequest {
+  string alert_id = 1;
+  string operator_id = 2;  // 接管人
+  Role role = 3;
+  string note = 4;
+  google.protobuf.Timestamp occurred_at_ground = 5;
+}
+
+message AcknowledgeAlertResponse {
+  AlertState state = 1;
+  string current_owner = 2;
+}
+
+message AppendResolutionEvidenceRequest {
+  string alert_id = 1;
+  string operator_id = 2;
+  Role role = 3;
+  string summary = 4;  // 解除证据说明（测量值、处置措施等）
+  google.protobuf.Timestamp occurred_at_ground = 5;
+}
+
+message AppendResolutionEvidenceResponse {
+  AlertState state = 1;
+  int32 evidence_count = 2;
+}
+
+// 已确认的红色告警不可删除；服务端对所有告警一律拒绝删除，
+// 只允许追加解除证据。该 RPC 存在是为了显式返回这一约束。
+message DeleteAlertRequest {
+  string alert_id = 1;
+  string operator_id = 2;
+  Role role = 3;
+}
+
+message DeleteAlertResponse {}
+
+// ---------------------------------------------------------------------------
+// 交班视图与审计
+// ---------------------------------------------------------------------------
+
+message EvidenceSample {
+  string sensor_id = 1;
+  int64 sequence = 2;
+  google.protobuf.Timestamp device_time = 3;
+  double value = 4;
+  string unit = 5;
+  double breached_limit = 6;  // 该采样越过的是哪条限值
+}
+
+message EscalationEntry {
+  int32 level = 1;
+  google.protobuf.Timestamp due_ground_time = 2;       // 应升级时刻（确定性）
+  google.protobuf.Timestamp recorded_ground_time = 3;  // 系统处理时刻
+  string reason = 4;
+}
+
+message ResolutionEntry {
+  string summary = 1;
+  string appended_by = 2;
+  Role role = 3;
+  google.protobuf.Timestamp ground_time = 4;
+  bool auto_generated = 5;  // 遥测证实恢复时由系统追加
+}
+
+message AcknowledgementEntry {
+  string operator_id = 1;
+  Role role = 2;
+  string note = 3;
+  google.protobuf.Timestamp ground_time = 4;
+}
+
+// 医学暴露统计：由证据采样在读取时计算。
+message ExposureStats {
+  double max_value = 1;
+  double mean_value = 2;
+  google.protobuf.Duration duration_above_warning = 3;
+  google.protobuf.Duration duration_above_critical = 4;
+  int32 sample_count = 5;
+}
+
+message SensorHealth {
+  string sensor_id = 1;
+  int64 last_sequence = 2;
+  google.protobuf.Timestamp last_device_time = 3;
+  google.protobuf.Timestamp last_ground_time = 4;
+  google.protobuf.Duration silence_for = 5;  // 距读取时刻的静默时长（地面时钟）
+  int32 drift_observations = 6;              // 设备时钟回退观测次数
+  int32 conflict_observations = 7;           // 同序列不同值冲突次数
+}
+
+// 交班视图中的单条告警。服务端按请求角色裁剪字段：
+// 乘组获得可执行摘要与接管人；医学获得暴露统计与证据取值；
+// 飞控获得全部字段（证据采样、阈值版本、升级历史等）。
+message HandoverAlert {
+  string alert_id = 1;
+  string rule = 2;
+  Severity severity = 3;
+  AlertState state = 4;
+  string summary = 5;
+  string recommended_crew_action = 6;
+
+  // 当前由谁接管
+  string current_owner = 7;
+  Role owner_role = 8;
+  google.protobuf.Timestamp acknowledged_at = 9;
+
+  // 距离下一次升级还有多久
+  int32 current_escalation_level = 10;
+  google.protobuf.Timestamp next_escalation_due = 11;
+  google.protobuf.Duration escalation_countdown = 12;  // 读取时计算
+
+  repeated EscalationEntry escalation_history = 13;
+  repeated EvidenceSample evidence_samples = 14;  // 该告警由哪些采样形成
+  ExposureStats exposure = 15;
+  string threshold_version = 16;
+  MissionPhase mission_phase = 17;
+
+  bool insufficient_evidence = 18;  // 当前证据不足（关联传感器缺失）
+  repeated string missing_corroborators = 19;
+
+  repeated ResolutionEntry resolution_evidence = 20;
+  repeated AcknowledgementEntry acknowledgement_history = 21;
+
+  google.protobuf.Timestamp opened_device_time = 22;
+  google.protobuf.Timestamp opened_ground_time = 23;
+}
+
+message GetHandoverViewRequest {
+  Role role = 1;
+}
+
+message GetHandoverViewResponse {
+  google.protobuf.Timestamp generated_at = 1;
+  repeated HandoverAlert alerts = 2;  // 未决告警在前，已解除的保留可查
+  repeated SensorHealth sensor_health = 3;
+}
+
+message GetAlertRequest {
+  string alert_id = 1;
+  Role role = 2;
+}
+
+message GetAlertResponse {
+  HandoverAlert alert = 1;
+}
+
+message EvaluationRecord {
+  int64 id = 1;
+  string rule = 2;
+  google.protobuf.Timestamp window_end_device_time = 3;
+  Verdict verdict = 4;
+  Severity severity = 5;
+  string threshold_version = 6;
+  MissionPhase mission_phase = 7;
+  string detail = 8;  // 判定依据的人读摘要（窗口、样本数、缺失关联传感器等）
+  google.protobuf.Timestamp ground_time = 9;
+}
+
+message ListEvaluationsRequest {
+  string rule = 1;   // 空 = 全部规则
+  int32 limit = 2;   // 0 = 默认 100
+}
+
+message ListEvaluationsResponse {
+  repeated EvaluationRecord evaluations = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 服务
+// ---------------------------------------------------------------------------
+
+service LifeSupportAlerts {
+  // 遥测注入（含离线补传；按原始采样序列归并，重复帧去重，幂等）。
+  rpc IngestSamples(IngestSamplesRequest) returns (IngestSamplesResponse);
+  rpc RegisterThresholdVersion(RegisterThresholdVersionRequest) returns (RegisterThresholdVersionResponse);
+  rpc SetMissionPhase(SetMissionPhaseRequest) returns (SetMissionPhaseResponse);
+  rpc AcknowledgeAlert(AcknowledgeAlertRequest) returns (AcknowledgeAlertResponse);
+  rpc AppendResolutionEvidence(AppendResolutionEvidenceRequest) returns (AppendResolutionEvidenceResponse);
+  rpc DeleteAlert(DeleteAlertRequest) returns (DeleteAlertResponse);
+  rpc GetHandoverView(GetHandoverViewRequest) returns (GetHandoverViewResponse);
+  rpc GetAlert(GetAlertRequest) returns (GetAlertResponse);
+  rpc ListEvaluations(ListEvaluationsRequest) returns (ListEvaluationsResponse);
+}
